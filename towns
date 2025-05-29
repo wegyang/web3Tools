@@ -1,0 +1,267 @@
+import random
+import sys
+import time
+import json
+import logging
+from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
+
+from ixbrowser_local_api import IXBrowserClient
+from selenium.webdriver import Chrome, ActionChains, Keys
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.wait import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+
+# 配置日志系统
+def setup_logging():
+    """更健壮的日志配置"""
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+
+    log_file = 'browser_operations.log'
+
+    file_handler = RotatingFileHandler(
+        log_file,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding='utf-8'
+    )
+    file_handler.setFormatter(
+        logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    )
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(
+        logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    )
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+
+setup_logging()
+logger = logging.getLogger(__name__)
+
+# 时间记录文件路径
+TIMESTAMP_FILE = 'profile_timestamps.json'
+
+config = {
+    "button_a_xpath": "/html/body/div/span[1]/span/div[1]/div/span[4]/span[1]",
+    "canvas_locator": "span._153ynsn0._3zlyma5ms._3zlymaa._3zlyma6k1._3zlyma6hj canvas",
+    "pay_button_xpath": "//button[contains(., 'Pay with ETH')]",
+    "message_input_selector": '[data-testid="send-message-text-box"][contenteditable="true"]',
+    "send_hotkey": Keys.CONTROL + Keys.ENTER,
+    "interaction_delay": 3,
+    "message_delay": 5,
+    "max_message": 2,
+    "min_interval": 120,  # 2分钟（秒）
+    "max_interval": 600,  # 10分钟（秒）
+    "cooldown": 86400  # 24小时冷却时间（秒）
+}
+
+
+def load_timestamps():
+    """加载时间戳记录"""
+    try:
+        with open(TIMESTAMP_FILE, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_timestamps(timestamps):
+    """保存时间戳记录"""
+    with open(TIMESTAMP_FILE, 'w') as f:
+        json.dump(timestamps, f, indent=2)
+
+
+def get_eligible_profiles(profile_list):
+    """获取符合条件（超过24小时未操作）的配置列表"""
+    timestamps = load_timestamps()
+    eligible = []
+
+    for profile in profile_list:
+        profile_id = profile['profile_id']
+        last_op = timestamps.get(profile_id)
+
+        # 从未操作过或超过冷却时间
+        if not last_op or (datetime.now() - datetime.fromisoformat(last_op)) > timedelta(seconds=config["cooldown"]):
+            eligible.append(profile)
+
+    return eligible
+
+
+def open_single_profile(profile):
+    """打开单个浏览器配置"""
+    try:
+        client = IXBrowserClient()
+        open_result = client.open_profile(
+            profile['profile_id'],
+            cookies_backup=False,
+            load_profile_info_page=False
+        )
+
+        if not open_result:
+            logger.error(f"打开配置失败: {client.code} - {client.message}")
+            return None
+
+        chrome_options = Options()
+        chrome_options.add_experimental_option("debuggerAddress", open_result['debugging_address'])
+
+        driver = Chrome(
+            service=Service(open_result['webdriver']),
+            options=chrome_options
+        )
+        return driver
+    except Exception as e:
+        logger.error(f"打开配置时发生错误: {str(e)}")
+        return None
+
+def retry_operation(operation_func, description, max_retries=2):
+    """带重试的操作执行函数"""
+    retries = 0
+    last_error = None
+    while retries < max_retries:
+        try:
+            operation_func()
+            print(f"{description}成功")
+            return True
+        except Exception as error:
+            last_error = error
+            print(f"{description}失败（尝试 {retries+1}/{max_retries}）: {str(error)}")
+            retries += 1
+            if retries < max_retries:
+                print("等待3秒后重试...")
+                time.sleep(3)
+    raise Exception(f"{description}失败，已重试{max_retries-1}次") from last_error
+
+def process_single_profile(profile):
+    """处理单个配置的完整流程"""
+    driver = None
+    success_sta = False
+    try:
+        # 打开配置
+        driver = open_single_profile(profile)
+        if not driver:
+            return False
+
+        # 执行导航
+        driver.get('https://app.towns.com')
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.XPATH, '//body')))
+        time.sleep(5)  # 等待页面加载
+
+        # 执行交互操作
+        # [这里保留原有的操作逻辑，根据需要调整]
+        # 示例：点击钱包按钮
+        # WebDriverWait(driver, 15).until(
+        #     EC.element_to_be_clickable((By.XPATH, config["button_a_xpath"]))
+        # ).click()
+        # time.sleep(config["interaction_delay"])
+
+        # [其他操作步骤...]
+        profile_id = profile['profile_id']
+        # 第一步：点击钱包按钮
+        retry_operation(
+            operation_func=lambda: (
+                button := WebDriverWait(driver, 15).until(
+                    EC.element_to_be_clickable((By.XPATH, config["button_a_xpath"]))),
+                driver.execute_script("arguments[0].click();", button),
+                time.sleep(config["interaction_delay"])
+            ),
+            description=f"配置 {profile_id} 点击钱包按钮",
+            max_retries=2
+        )
+
+        # 第二步：点击肚子区域
+        retry_operation(
+            operation_func=lambda: (
+                canvas := WebDriverWait(driver, 15).until(
+                    EC.visibility_of_element_located((By.CSS_SELECTOR, config["canvas_locator"]))),
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", canvas),
+                time.sleep(1),
+                ActionChains(driver).move_to_element(canvas).pause(1).click().perform()
+            ),
+            description=f"配置 {profile_id} 点击肚子区域",
+            max_retries=2
+        )
+
+        # 第三步：点击支付按钮
+        retry_operation(
+            operation_func=lambda: (
+                pay_button := WebDriverWait(driver, 15).until(
+                    EC.element_to_be_clickable((By.XPATH, config["pay_button_xpath"]))),
+                pay_button.click(),
+                time.sleep(config["interaction_delay"])
+            ),
+            description=f"配置 {profile_id} 点击支付按钮",
+            max_retries=2
+        )
+
+        # 更新操作时间
+        timestamps = load_timestamps()
+        timestamps[profile['profile_id']] = datetime.now().isoformat()
+        save_timestamps(timestamps)
+        success_sta = True
+        return True
+
+    except Exception as e:
+        logger.error(f"处理配置时发生错误: {str(e)}")
+        return False
+    finally:
+        if driver:
+            driver.quit()
+            # 关闭浏览器配置
+            client = IXBrowserClient()
+            client.close_profile(profile['profile_id'])
+        return success_sta
+
+def main():
+    # 初始化客户端
+    client = IXBrowserClient()
+
+    # 获取所有配置
+    profiles = client.get_profile_list(page=1, limit=100)
+    if not profiles:
+        logger.error("无法获取配置列表")
+        return
+
+    # 获取符合条件的配置
+    eligible_profiles = get_eligible_profiles(profiles)
+    if not eligible_profiles:
+        logger.info("当前没有需要处理的配置")
+        return
+
+    # 随机打乱顺序
+    random.shuffle(eligible_profiles)
+    total = len(eligible_profiles)
+
+    logger.info(f"开始处理 {total} 个配置")
+
+    for idx, profile in enumerate(eligible_profiles):
+        logger.info(f"正在处理配置 {idx + 1}/{total}: {profile.get('name')}")
+
+        # 执行处理流程
+        start_time = time.time()
+        success = process_single_profile(profile)
+        elapsed = time.time() - start_time
+
+        logger.info(f"处理完成，结果: {'成功' if success else '失败'}, 耗时: {elapsed:.2f}秒")
+
+        # 如果不是最后一个配置，添加随机间隔
+        if idx < total - 1:
+            delay = random.randint(config["min_interval"], config["max_interval"])
+            logger.info(f"等待 {delay // 60}分{delay % 60}秒后进行下一个处理...")
+            print(f"等待 {delay // 60}分{delay % 60}秒后进行下一个处理...")
+            time.sleep(delay)
+
+    logger.info("所有配置处理完成")
+
+
+if __name__ == "__main__":
+    logger.info("==== 程序开始运行 ====")
+    main()
+    logger.info("==== 程序运行结束 ====")
